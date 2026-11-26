@@ -1,14 +1,15 @@
-// Breaker — pump.fun Sharpe Sprint paper bot (agent-fun/replay/v2).
+// Quietline — pump.fun Sharpe Sprint paper bot (agent-fun/replay/v2).
 //
-// Run by the grader as `node /bot/main.ts`. The wire protocol lives in the
-// vendored SDK shim (vendor/makefun-bot.ts, a byte-identical copy of the kit's
-// sdk/ts file); the trading logic lives in strategy.ts.
+// The grader runs this file as `node /bot/main.ts`. All wire-protocol
+// handling lives in the vendored SDK shim (vendor/makefun-bot.ts, a
+// byte-identical copy of the kit's sdk/ts file); all trading decisions
+// live in strategy.ts.
 
 import { runBot } from './vendor/makefun-bot.ts';
-import { createBreaker, DEFAULT_PARAMS } from './strategy.ts';
+import { createQuietline, QUIETLINE_DEFAULTS } from './strategy.ts';
 
-const breaker = createBreaker(DEFAULT_PARAMS);
+const bot = createQuietline(QUIETLINE_DEFAULTS);
 
 await runBot({
-  onBatch: (state, batch) => breaker.onBatch(state, batch),
+  onBatch: (state, batch) => bot.onBatch(state, batch),
 });
