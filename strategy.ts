@@ -1,39 +1,37 @@
-// Quietline: a surge-cross paper trader for agent-fun/replay/v2 (pump.fun).
+// Swiftline — a velocity-sized surge-cross trader for agent-fun/replay/v2.
 //
-// Why this shape? A pump.fun launch is guilty until proven innocent: the
-// overwhelming majority bleed out in seconds. The minority that attract real
-// money push their real SOL reserve up toward the graduation zone (~85 SOL)
-// and tend to keep travelling. Quietline therefore spends nothing on a coin
-// until the coin has done the proving itself:
+// The starting point is a simple observation about pump.fun launches: most
+// of them are noise, and the honest signal is money arriving. A coin earns
+// attention only after its real SOL reserve has pushed through 40 SOL, and
+// even then it has to pass a checklist (enough independent buyers, enough
+// net buying, a sane price multiple, a creator who has not sold and did not
+// load up at birth). That checklist is inherited from the surge-cross design
+// this bot revises.
 //
-//   * the real reserve has crossed 40 SOL, recently (inside 800 slots),
-//   * four or more separate wallets have bought, with 3+ SOL of net buying
-//     (buys minus sells by everyone except the creator) behind the move,
-//   * the price sits between 1.1x and 8x of where it started — moving, but
-//     not already vertical,
-//   * the creator has not sold a single token, and their own opening buy in
-//     the create slot was no more than 2 SOL.
+// What Swiftline adds is a clock on the money itself. While watching a coin
+// we note the slot where the real reserve first reached 20 SOL, halfway to
+// the trigger. Coins whose 20-to-40 leg took more than 200 slots got there
+// by grinding, and in testing those grinders produced almost all of the
+// losses. Coins that covered the leg quickly are a different animal. So
+// instead of a flat stake, entry size follows the leg:
 //
-// The entry is the crossing itself: one flat 0.5 SOL stake, one shot per
-// coin, never more than five positions open at once. The position then
-// answers to a short list of exits — bank at +20%, bail at -15%, a hard
-// 300-slot holding cap, a creator sale, or silence: if nobody has traded
-// the coin for 50 slots the story is over and the bot leaves. That quiet
-// exit is the one change this revision makes to the earlier surge-cross
-// tuning (which waited 60 slots): on the dev window, leaving a little
-// sooner after the tape goes dead raised both net PnL and the hourly
-// Sharpe, because capital parked in a dead coin is pure variance.
+//   * fast leg (<= 200 slots): the normal 0.5 SOL stake,
+//   * slow leg, or no 20 SOL sighting before the cross: a token 0.02 SOL.
 //
-// Several knobs exist but ship parked wide open (dip band, recent-flow
-// gates, trailing stop, flow exit). They are kept in the parameter set
-// because they describe real ideas, but every retune so far — the original
-// session's and this one — found they cost money when tightened: waiting
-// for a dip misses the move, flow exits amputate winners on noise, and a
-// trailing stop fires at the same moment the take-profit would anyway.
+// Slow coins are still bought — the position keeps the trade count honest
+// and occasionally one wakes up — but they are no longer allowed to drag
+// the equity curve around at full size. Exits are unchanged from the
+// surge-cross template: +20% take-profit, -15% stop-loss, a 300-slot age
+// limit, an exit when the tape has been silent for 50 slots, and an exit
+// if the creator sells after we are in.
 //
-// The bot is a pure function of the batches it receives: no clock reads,
-// no randomness, no network, no file access, so two runs over the same
-// tape produce the same orders byte for byte.
+// A handful of extra gates (dip band, recent flow, trailing stop, flow
+// exit) exist in the tuning object with thresholds set so wide they never
+// fire. They are deliberate placeholders: each was tightened at some point
+// during tuning and each tightening lost money, so they ship parked.
+//
+// Everything here is deterministic: decisions depend only on the batches
+// received, never on a clock, randomness, the network, or the filesystem.
 
 import {
   BPS,
@@ -43,396 +41,411 @@ import {
   type Pubkey,
 } from './vendor/makefun-bot.ts';
 
-export interface QuietlineParams {
-  /** Real SOL reserve (lamports) a curve must reach to count as surging. */
-  surgeReserveLamports: bigint;
-  /** How long (slots) a surge stays actionable after the crossing. */
-  surgeWindowSlots: number;
-  /** Entry price must be within this band under the post-surge high (bps). */
-  dipLowBps: number;
-  dipHighBps: number;
-  /** Distinct non-creator wallets that must have bought before entry. */
-  minDistinctBuyers: number;
-  /** Buys minus other wallets' sells since creation, at least (lamports). */
-  minNetBoughtLamports: bigint;
-  /** Entry price over the create price, allowed band (bps of the ratio). */
-  runupLowBps: number;
-  runupHighBps: number;
-  /** The creator's create-slot buys, at most (lamports). */
-  creatorBuyCapLamports: bigint;
-  /** Biggest single non-creator sell, as bps of the reserve before it. */
-  worstSellCapBps: number;
-  /** Recent-flow lookback (slots) plus its entry gates. */
-  flowLookbackSlots: number;
-  minFlowNetLamports: bigint;
-  minFlowBuyers: number;
-  /** Real SOL reserve the curve must still hold when the buy is placed. */
-  entryReserveFloorLamports: bigint;
-  /** Flat stake per coin (lamports), also capped by the harness reserve cap. */
-  stakeLamports: bigint;
-  /** Smallest buy worth paying a transaction fee for (lamports). */
-  minOrderLamports: bigint;
-  /** Slippage tolerance attached to buys (bps). */
+/** All knobs in one place; amounts are lamports, ratios are basis points. */
+export interface SwiftlineTuning {
+  crossReserve: bigint; // real reserve that marks a coin as surging
+  crossFreshnessSlots: number; // how long a cross stays buyable
+  waypointReserve: bigint; // halfway reserve used to time the climb
+  waypointMaxLegSlots: number; // 20-to-40 leg longer than this is "slow"
+  slowStake: bigint; // entry size for slow coins
+  fullStake: bigint; // entry size for fast coins
+  smallestOrder: bigint; // below this a buy is not worth its fee
+  reserveFloorAtEntry: bigint; // reserve must still be at least this
+  buyersNeeded: number; // distinct non-creator buying wallets
+  netBoughtNeeded: bigint; // non-creator buys minus sells, minimum
+  creatorBirthBuyMax: bigint; // creator's create-slot buying, maximum
+  priceMultipleMinBps: number; // entry price vs birth price, low end
+  priceMultipleMaxBps: number; // entry price vs birth price, high end
+  dipBandMinBps: number; // parked gate: dip below post-cross peak
+  dipBandMaxBps: number;
+  biggestSellMaxBps: number; // parked gate: largest single sell share
+  recentWindowSlots: number; // lookback for the parked flow gates
+  recentNetMin: bigint;
+  recentBuyersMin: number;
   buySlippageBps: number;
-  /** Sell in full once the position is worth this far over basis (bps). */
-  gainExitBps: number;
-  /** Sell in full once the position is worth this far under basis (bps). */
-  lossExitBps: number;
-  /** Trailing stop: arm this far above basis, exit on this fall (bps). */
-  trailArmBps: number;
-  trailDropBps: number;
-  /** Leave after this many slots in the position, whatever the price. */
-  holdCapSlots: number;
-  /** Leave when the coin has not traded for this many slots. */
-  quietSlots: number;
-  /** Leave when recent net flow drops below minus this (lamports). */
-  flowExitLamports: bigint;
-  /** Refuse (and abandon) any coin whose creator has sold. */
-  skipCreatorSold: boolean;
+  profitExitBps: number; // sell everything this far above basis
+  lossExitBps: number; // sell everything this far below basis
+  trailArmBps: number; // parked gate: trailing stop arming level
+  trailGivebackBps: number; // parked gate: trailing stop give-back
+  maxHoldSlots: number; // age limit for any position
+  silenceExitSlots: number; // exit after this long without a trade
+  flowExitFloor: bigint; // parked gate: recent net flow exit level
+  bailOnCreatorSale: boolean; // refuse/exit coins whose creator sold
 }
 
-export const QUIETLINE_DEFAULTS: QuietlineParams = {
-  surgeReserveLamports: 40_000_000_000n,
-  surgeWindowSlots: 800,
-  dipLowBps: 0,
-  dipHighBps: 2000,
-  minDistinctBuyers: 4,
-  minNetBoughtLamports: 3_000_000_000n,
-  runupLowBps: 11_000,
-  runupHighBps: 80_000,
-  creatorBuyCapLamports: 2_000_000_000n,
-  worstSellCapBps: 10_000,
-  flowLookbackSlots: 15,
-  minFlowNetLamports: -1_000_000_000_000n,
-  minFlowBuyers: 0,
-  entryReserveFloorLamports: 30_000_000_000n,
-  stakeLamports: 500_000_000n,
-  minOrderLamports: 10_000_000n,
+export const SWIFTLINE_TUNING: SwiftlineTuning = {
+  crossReserve: 40_000_000_000n,
+  crossFreshnessSlots: 800,
+  waypointReserve: 20_000_000_000n,
+  waypointMaxLegSlots: 200,
+  slowStake: 20_000_000n,
+  fullStake: 500_000_000n,
+  smallestOrder: 10_000_000n,
+  reserveFloorAtEntry: 30_000_000_000n,
+  buyersNeeded: 4,
+  netBoughtNeeded: 3_000_000_000n,
+  creatorBirthBuyMax: 2_000_000_000n,
+  priceMultipleMinBps: 11_000,
+  priceMultipleMaxBps: 80_000,
+  dipBandMinBps: 0,
+  dipBandMaxBps: 2000,
+  biggestSellMaxBps: 10_000,
+  recentWindowSlots: 15,
+  recentNetMin: -1_000_000_000_000n,
+  recentBuyersMin: 0,
   buySlippageBps: 10_000,
-  gainExitBps: 2000,
+  profitExitBps: 2000,
   lossExitBps: 1500,
   trailArmBps: 1_000_000,
-  trailDropBps: 1000,
-  holdCapSlots: 300,
-  quietSlots: 50,
-  flowExitLamports: 1_000_000_000_000n,
-  skipCreatorSold: true,
+  trailGivebackBps: 1000,
+  maxHoldSlots: 300,
+  silenceExitSlots: 50,
+  flowExitFloor: 1_000_000_000_000n,
+  bailOnCreatorSale: true,
 };
 
-interface TapeEntry {
+/** One trade from the tape, kept only while the flow window can see it. */
+interface TapeRow {
   slot: number;
-  isBuy: boolean;
-  sol: bigint;
-  user: Pubkey;
+  bought: boolean;
+  solAmount: bigint;
+  wallet: Pubkey;
 }
 
-/** Everything the bot remembers about one mint it has seen created. */
-interface CoinLedger {
+/** Per-mint memory, built from CreateEvent onwards. */
+interface MintWatch {
   mint: Pubkey;
   creator: Pubkey;
-  bornSlot: number;
-  bornQuote: bigint;
-  bornTokens: bigint;
-  creatorOpeningBuy: bigint;
+  birthSlot: number;
+  birthQuoteReserves: bigint;
+  birthTokenReserves: bigint;
+  creatorBirthBought: bigint;
   creatorHasSold: boolean;
-  buyerWallets: Set<Pubkey>;
-  boughtTotal: bigint;
-  soldByOthers: bigint;
-  biggestSellBps: number;
-  surgeSlot: number | null;
-  peakSinceSurge: number;
-  lastTapeSlot: number;
-  tape: TapeEntry[];
-  buyPlaced: boolean;
-  retired: boolean;
+  walletsThatBought: Set<Pubkey>;
+  grossBought: bigint;
+  grossSoldByOthers: bigint;
+  largestSellShareBps: number;
+  waypointSlot: number | null; // first slot real reserve reached 20 SOL
+  crossSlot: number | null; // first slot real reserve reached 40 SOL
+  peakPriceAfterCross: number;
+  lastTradeSlot: number;
+  recentTape: TapeRow[];
+  buyAttempted: boolean;
+  finished: boolean;
 }
 
-/** Bookkeeping for one live position, keyed separately from the ledger. */
-interface PositionTrack {
-  openedSlot: number;
-  feesPaid: bigint;
-  bestValue: bigint;
-  creatorSoldWhenOpened: boolean;
+/** Per-position memory, separate from the mint watch. */
+interface OpenDeal {
+  entrySlot: number;
+  feesSoFar: bigint;
+  bestSeenValue: bigint;
+  creatorHadSoldAtEntry: boolean;
 }
 
-export interface Quietline {
-  onBatch(state: BotState, batch: Batch): OrderInput[];
+export interface Swiftline {
+  handleBatch(state: BotState, batch: Batch): OrderInput[];
 }
 
-export function createQuietline(params: QuietlineParams = QUIETLINE_DEFAULTS): Quietline {
-  const P = params;
-  const ledgers = new Map<Pubkey, CoinLedger>();
-  const tracks = new Map<Pubkey, PositionTrack>();
-  /** Mints that already have a sell order in flight. */
-  const sellInFlight = new Set<Pubkey>();
+export function buildSwiftline(tuning: SwiftlineTuning = SWIFTLINE_TUNING): Swiftline {
+  const T = tuning;
+  const watches = new Map<Pubkey, MintWatch>();
+  const deals = new Map<Pubkey, OpenDeal>();
+  const exitQueued = new Set<Pubkey>();
 
-  /** Net flow and distinct buyers inside the lookback window ending at `slot`. */
-  function windowFlow(c: CoinLedger, slot: number): { net: bigint; buyers: number } {
-    const cutoff = slot - P.flowLookbackSlots;
-    let stale = 0;
-    while (stale < c.tape.length && c.tape[stale]!.slot <= cutoff) stale++;
-    if (stale > 0) c.tape.splice(0, stale);
+  // Net flow plus distinct buyer count over the trailing window. Rows that
+  // have aged out of the window are dropped as a side effect.
+  function recentFlow(w: MintWatch, atSlot: number): { net: bigint; buyers: number } {
+    const earliest = atSlot - T.recentWindowSlots;
+    let drop = 0;
+    while (drop < w.recentTape.length && w.recentTape[drop]!.slot <= earliest) drop++;
+    if (drop > 0) w.recentTape.splice(0, drop);
     let net = 0n;
-    const wallets = new Set<Pubkey>();
-    for (const t of c.tape) {
-      if (t.isBuy) {
-        net += t.sol;
-        if (t.user !== c.creator) wallets.add(t.user);
+    const buyers = new Set<Pubkey>();
+    for (const row of w.recentTape) {
+      if (row.bought) {
+        net += row.solAmount;
+        if (row.wallet !== w.creator) buyers.add(row.wallet);
       } else {
-        net -= t.sol;
+        net -= row.solAmount;
       }
     }
-    return { net, buyers: wallets.size };
+    return { net, buyers: buyers.size };
   }
 
-  function hasPending(state: BotState, mint: Pubkey, side: 'buy' | 'sell'): boolean {
+  // The velocity verdict for a crossed coin, as a stake size. The leg is
+  // measured between the two stamps (waypoint first sighting, then the
+  // cross), never from "now", so a coin judged fast stays fast even if the
+  // remaining entry gates take a few more slots to line up. A waypoint
+  // that was never stamped counts as slow: no evidence of speed, no size.
+  function stakeFor(w: MintWatch): bigint {
+    if (w.crossSlot === null || w.waypointSlot === null) return T.slowStake;
+    return w.crossSlot - w.waypointSlot > T.waypointMaxLegSlots ? T.slowStake : T.fullStake;
+  }
+
+  function pendingExists(state: BotState, mint: Pubkey, side: 'buy' | 'sell'): boolean {
     for (const p of state.pending.values()) {
       if (p.order.mint === mint && p.order.side === side) return true;
     }
     return false;
   }
 
-  /**
-   * The exit ladder, judged in one place. A position leaves when any rung
-   * fires: the price rungs compare the live sale value against the full
-   * basis (stake plus the fees already paid), the time rungs count slots,
-   * and the story rungs watch the coin itself — a creator who sells after
-   * we bought, a tape that has gone quiet, or a recent flow that has
-   * turned into net distribution. Order among the rungs does not matter;
-   * the first one that fires ends the position.
-   */
-  function shouldLeave(
-    c: CoinLedger | undefined,
-    track: PositionTrack,
-    value: bigint,
+  // Every reason to close a position, checked together. Price reasons use
+  // the full basis (what the position cost plus fees already paid); the
+  // rest are about time passing or the coin's own story breaking down.
+  function exitReasonFound(
+    w: MintWatch | undefined,
+    deal: OpenDeal,
+    saleValue: bigint,
     basis: bigint,
-    now: number,
+    atSlot: number,
   ): boolean {
     if (basis > 0n) {
-      if (value * BPS >= basis * (BPS + BigInt(P.gainExitBps))) return true;
-      if (value * BPS <= basis * (BPS - BigInt(P.lossExitBps))) return true;
-      const trailingArmed = track.bestValue * BPS >= basis * (BPS + BigInt(P.trailArmBps));
-      if (trailingArmed && value * BPS <= track.bestValue * (BPS - BigInt(P.trailDropBps))) {
+      if (saleValue * BPS >= basis * (BPS + BigInt(T.profitExitBps))) return true;
+      if (saleValue * BPS <= basis * (BPS - BigInt(T.lossExitBps))) return true;
+      const trailArmed = deal.bestSeenValue * BPS >= basis * (BPS + BigInt(T.trailArmBps));
+      if (trailArmed && saleValue * BPS <= deal.bestSeenValue * (BPS - BigInt(T.trailGivebackBps))) {
         return true;
       }
     }
-    if (now - track.openedSlot >= P.holdCapSlots) return true;
-    if (c !== undefined) {
-      if (P.skipCreatorSold && c.creatorHasSold && !track.creatorSoldWhenOpened) return true;
-      if (now - c.lastTapeSlot >= P.quietSlots) return true;
-      if (windowFlow(c, now).net < -P.flowExitLamports) return true;
+    if (atSlot - deal.entrySlot >= T.maxHoldSlots) return true;
+    if (w !== undefined) {
+      if (T.bailOnCreatorSale && w.creatorHasSold && !deal.creatorHadSoldAtEntry) return true;
+      if (atSlot - w.lastTradeSlot >= T.silenceExitSlots) return true;
+      if (recentFlow(w, atSlot).net < -T.flowExitFloor) return true;
     }
     return false;
   }
 
   return {
-    onBatch(state, batch) {
-      const now = batch.slot;
-      const movedThisBatch = new Set<Pubkey>();
-      const txFee = state.txFeeLamports();
-      const curveFeeBps = BigInt(
+    handleBatch(state, batch) {
+      const slotNow = batch.slot;
+      const tradedHere = new Set<Pubkey>();
+      const perTxFee = state.txFeeLamports();
+      const totalFeeBps = BigInt(
         state.hello.fees.protocol_bps_fallback + state.hello.fees.creator_bps_fallback,
       );
 
-      // ---- Step 1: fold the batch's events into the per-coin ledgers. ----
-      for (const e of batch.events) {
-        if (e.event === 'CreateEvent') {
-          ledgers.set(e.mint, {
-            mint: e.mint,
-            creator: e.creator,
-            bornSlot: e.slot,
-            bornQuote: BigInt(e.virtual_quote_reserves),
-            bornTokens: BigInt(e.virtual_token_reserves),
-            creatorOpeningBuy: 0n,
+      // Pass 1: absorb events. Creations open a watch; trades update the
+      // watch (including the 20 SOL waypoint stamp and the 40 SOL cross
+      // stamp); anything terminal closes the watch for good.
+      for (const ev of batch.events) {
+        if (ev.event === 'CreateEvent') {
+          watches.set(ev.mint, {
+            mint: ev.mint,
+            creator: ev.creator,
+            birthSlot: ev.slot,
+            birthQuoteReserves: BigInt(ev.virtual_quote_reserves),
+            birthTokenReserves: BigInt(ev.virtual_token_reserves),
+            creatorBirthBought: 0n,
             creatorHasSold: false,
-            buyerWallets: new Set(),
-            boughtTotal: 0n,
-            soldByOthers: 0n,
-            biggestSellBps: 0,
-            surgeSlot: null,
-            peakSinceSurge: 0,
-            lastTapeSlot: e.slot,
-            tape: [],
-            buyPlaced: false,
-            retired: false,
+            walletsThatBought: new Set(),
+            grossBought: 0n,
+            grossSoldByOthers: 0n,
+            largestSellShareBps: 0,
+            waypointSlot: null,
+            crossSlot: null,
+            peakPriceAfterCross: 0,
+            lastTradeSlot: ev.slot,
+            recentTape: [],
+            buyAttempted: false,
+            finished: false,
           });
-        } else if (e.event === 'TradeEvent') {
-          const c = ledgers.get(e.mint);
-          if (c === undefined) continue;
-          const sol = BigInt(e.sol_amount);
-          const marginal = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
-          c.lastTapeSlot = e.slot;
-          c.tape.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
-          movedThisBatch.add(e.mint);
-          if (c.surgeSlot === null && BigInt(e.real_quote_reserves) >= P.surgeReserveLamports) {
-            c.surgeSlot = e.slot;
-            c.peakSinceSurge = marginal;
-          } else if (c.surgeSlot !== null && marginal > c.peakSinceSurge) {
-            c.peakSinceSurge = marginal;
-          }
-          const fromCreator = e.user === c.creator;
-          if (e.is_buy) {
-            c.boughtTotal += sol;
-            if (fromCreator && e.slot === c.bornSlot) c.creatorOpeningBuy += sol;
-            else if (!fromCreator) c.buyerWallets.add(e.user);
-          } else if (fromCreator) {
-            c.creatorHasSold = true;
-          } else {
-            c.soldByOthers += sol;
-            const reserveBefore = BigInt(e.real_quote_reserves) + sol;
-            if (reserveBefore > 0n) {
-              const share = Number((sol * BPS) / reserveBefore);
-              if (share > c.biggestSellBps) c.biggestSellBps = share;
-            }
-          }
-        } else {
-          // Completion (or any other terminal event): done with this coin.
-          const c = ledgers.get(e.mint);
-          if (c !== undefined) c.retired = true;
-        }
-      }
-
-      // ---- Step 2: fold fills into position tracks. ----
-      for (const f of batch.fills) {
-        if (f.client_id.startsWith('_')) {
-          // The harness closed this mint itself; forget it completely.
-          tracks.delete(f.mint);
-          sellInFlight.delete(f.mint);
-          const c = ledgers.get(f.mint);
-          if (c !== undefined) c.retired = true;
           continue;
         }
-        const track = tracks.get(f.mint);
-        if (track !== undefined && f.status !== 'rejected') {
-          track.feesPaid += BigInt(f.tx_fee_lamports);
+        if (ev.event !== 'TradeEvent') {
+          const w = watches.get(ev.mint);
+          if (w !== undefined) w.finished = true;
+          continue;
         }
-        if (f.side === 'buy') {
-          if (f.status === 'filled' && track === undefined) {
-            tracks.set(f.mint, {
-              openedSlot: f.slot,
-              feesPaid: BigInt(f.tx_fee_lamports),
-              bestValue: 0n,
-              creatorSoldWhenOpened: ledgers.get(f.mint)?.creatorHasSold ?? false,
-            });
-          } else if (f.status !== 'filled') {
-            const c = ledgers.get(f.mint);
-            if (c !== undefined) c.buyPlaced = false;
+        const w = watches.get(ev.mint);
+        if (w === undefined) continue;
+        const sol = BigInt(ev.sol_amount);
+        const spotPrice = Number(ev.virtual_quote_reserves) / Number(ev.virtual_token_reserves);
+        w.lastTradeSlot = ev.slot;
+        w.recentTape.push({ slot: ev.slot, bought: ev.is_buy, solAmount: sol, wallet: ev.user });
+        tradedHere.add(ev.mint);
+
+        // The waypoint stamp comes first: a single trade can in principle
+        // carry the reserve past both levels, and the leg is measured
+        // between the two stamps, so order matters here.
+        if (w.waypointSlot === null && BigInt(ev.real_quote_reserves) >= T.waypointReserve) {
+          w.waypointSlot = ev.slot;
+        }
+        if (w.crossSlot === null && BigInt(ev.real_quote_reserves) >= T.crossReserve) {
+          w.crossSlot = ev.slot;
+          w.peakPriceAfterCross = spotPrice;
+        } else if (w.crossSlot !== null && spotPrice > w.peakPriceAfterCross) {
+          w.peakPriceAfterCross = spotPrice;
+        }
+
+        const isCreator = ev.user === w.creator;
+        if (ev.is_buy) {
+          w.grossBought += sol;
+          if (isCreator && ev.slot === w.birthSlot) {
+            w.creatorBirthBought += sol;
+          } else if (!isCreator) {
+            w.walletsThatBought.add(ev.user);
           }
+        } else if (isCreator) {
+          w.creatorHasSold = true;
         } else {
-          sellInFlight.delete(f.mint);
-          if (f.status === 'filled') {
-            tracks.delete(f.mint);
-            const c = ledgers.get(f.mint);
-            if (c !== undefined) c.retired = true;
+          w.grossSoldByOthers += sol;
+          const reserveBeforeThisSell = BigInt(ev.real_quote_reserves) + sol;
+          if (reserveBeforeThisSell > 0n) {
+            const shareBps = Number((sol * BPS) / reserveBeforeThisSell);
+            if (shareBps > w.largestSellShareBps) w.largestSellShareBps = shareBps;
           }
-        }
-      }
-      // Reconcile with harness state: drop tracks that no longer exist.
-      for (const mint of [...sellInFlight]) {
-        if (!hasPending(state, mint, 'sell')) sellInFlight.delete(mint);
-      }
-      for (const mint of [...tracks.keys()]) {
-        if (!state.positions.has(mint) && !sellInFlight.has(mint) && !hasPending(state, mint, 'buy')) {
-          tracks.delete(mint);
         }
       }
 
-      const orders: OrderInput[] = [];
-      const batchCap = state.hello.caps.max_orders_per_batch;
-      const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
+      // Pass 2: absorb fills. A filled buy opens a deal; a rejected buy
+      // frees the mint for another attempt; a filled sell closes both the
+      // deal and the watch. Fills the harness generated itself (client ids
+      // starting with '_') retire the mint outright.
+      for (const fill of batch.fills) {
+        if (fill.client_id.startsWith('_')) {
+          deals.delete(fill.mint);
+          exitQueued.delete(fill.mint);
+          const w = watches.get(fill.mint);
+          if (w !== undefined) w.finished = true;
+          continue;
+        }
+        const deal = deals.get(fill.mint);
+        if (deal !== undefined && fill.status !== 'rejected') {
+          deal.feesSoFar += BigInt(fill.tx_fee_lamports);
+        }
+        if (fill.side === 'buy') {
+          if (fill.status === 'filled' && deal === undefined) {
+            deals.set(fill.mint, {
+              entrySlot: fill.slot,
+              feesSoFar: BigInt(fill.tx_fee_lamports),
+              bestSeenValue: 0n,
+              creatorHadSoldAtEntry: watches.get(fill.mint)?.creatorHasSold ?? false,
+            });
+          } else if (fill.status !== 'filled') {
+            const w = watches.get(fill.mint);
+            if (w !== undefined) w.buyAttempted = false;
+          }
+        } else {
+          exitQueued.delete(fill.mint);
+          if (fill.status === 'filled') {
+            deals.delete(fill.mint);
+            const w = watches.get(fill.mint);
+            if (w !== undefined) w.finished = true;
+          }
+        }
+      }
+      // Drop bookkeeping the harness no longer agrees with.
+      for (const mint of [...exitQueued]) {
+        if (!pendingExists(state, mint, 'sell')) exitQueued.delete(mint);
+      }
+      for (const mint of [...deals.keys()]) {
+        if (!state.positions.has(mint) && !exitQueued.has(mint) && !pendingExists(state, mint, 'buy')) {
+          deals.delete(mint);
+        }
+      }
+
+      const out: OrderInput[] = [];
+      const replyCap = state.hello.caps.max_orders_per_batch;
+      const markByMint = new Map<Pubkey, { vQuote: bigint; vTokens: bigint }>();
       for (const m of batch.marks) {
-        marks.set(m.mint, {
-          vq: BigInt(m.virtual_quote_reserves),
-          vt: BigInt(m.virtual_token_reserves),
+        markByMint.set(m.mint, {
+          vQuote: BigInt(m.virtual_quote_reserves),
+          vTokens: BigInt(m.virtual_token_reserves),
         });
       }
 
-      /** Lamports a sale of `tokens` on curve (vq, vt) would actually return. */
-      const saleProceeds = (tokens: bigint, vq: bigint, vt: bigint): bigint => {
-        if (tokens <= 0n || vt <= 0n) return 0n;
-        const gross = (tokens * vq) / (vt + tokens);
-        const fee = (gross * curveFeeBps + BPS - 1n) / BPS;
-        const afterFees = gross - fee;
-        return afterFees > txFee ? afterFees - txFee : 0n;
+      // What selling `tokens` on the given curve would actually net, after
+      // the curve fee (rounded up) and one transaction fee.
+      const netSaleValue = (tokens: bigint, vQuote: bigint, vTokens: bigint): bigint => {
+        if (tokens <= 0n || vTokens <= 0n) return 0n;
+        const gross = (tokens * vQuote) / (vTokens + tokens);
+        const fee = (gross * totalFeeBps + BPS - 1n) / BPS;
+        const afterCurveFee = gross - fee;
+        return afterCurveFee > perTxFee ? afterCurveFee - perTxFee : 0n;
       };
 
-      // ---- Step 3: exits. Every open position is repriced and judged. ----
-      for (const [mint, pos] of state.positions) {
-        if (orders.length >= batchCap) break;
-        if (sellInFlight.has(mint)) continue;
-        const c = ledgers.get(mint);
-        let track = tracks.get(mint);
-        if (track === undefined) {
-          track = {
-            openedSlot: now,
-            feesPaid: txFee,
-            bestValue: 0n,
-            creatorSoldWhenOpened: c?.creatorHasSold ?? false,
+      // Pass 3: exits. Reprice every open position and close the ones
+      // whose exit reason has fired.
+      for (const [mint, position] of state.positions) {
+        if (out.length >= replyCap) break;
+        if (exitQueued.has(mint)) continue;
+        const w = watches.get(mint);
+        let deal = deals.get(mint);
+        if (deal === undefined) {
+          deal = {
+            entrySlot: slotNow,
+            feesSoFar: perTxFee,
+            bestSeenValue: 0n,
+            creatorHadSoldAtEntry: w?.creatorHasSold ?? false,
           };
-          tracks.set(mint, track);
+          deals.set(mint, deal);
         }
-        let mark = marks.get(mint);
+        let mark = markByMint.get(mint);
         if (mark === undefined) {
           const curve = state.curves.get(mint);
           if (curve === undefined) continue;
-          mark = { vq: curve.virtual_quote_reserves, vt: curve.virtual_token_reserves };
+          mark = { vQuote: curve.virtual_quote_reserves, vTokens: curve.virtual_token_reserves };
         }
-        const value = saleProceeds(pos.token_amount, mark.vq, mark.vt);
-        const basis = pos.cost_lamports + track.feesPaid;
-        if (value > track.bestValue) track.bestValue = value;
-
-        if (!shouldLeave(c, track, value, basis, now)) continue;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
-        sellInFlight.add(mint);
+        const valueNow = netSaleValue(position.token_amount, mark.vQuote, mark.vTokens);
+        const basis = position.cost_lamports + deal.feesSoFar;
+        if (valueNow > deal.bestSeenValue) deal.bestSeenValue = valueNow;
+        if (!exitReasonFound(w, deal, valueNow, basis, slotNow)) continue;
+        out.push({ side: 'sell', mint, token_amount: position.token_amount, max_slippage_bps: 10_000 });
+        exitQueued.add(mint);
       }
 
-      // ---- Step 4: entries. Only coins that traded this batch can qualify. ----
-      let cash = state.freeCashLamports();
-      let openCount = state.committedPositionCount();
-      for (const mint of movedThisBatch) {
-        if (orders.length >= batchCap) break;
-        const c = ledgers.get(mint);
-        if (c === undefined || c.retired || c.buyPlaced) continue;
-        if (openCount >= state.hello.caps.max_open_positions) break;
-        if (c.surgeSlot === null) continue;
-        if (now - c.surgeSlot > P.surgeWindowSlots) {
-          c.retired = true;
+      // Pass 4: entries. Only mints that traded in this batch are looked
+      // at, and every gate from the design has to pass before money moves.
+      let spendable = state.freeCashLamports();
+      let openDeals = state.committedPositionCount();
+      for (const mint of tradedHere) {
+        if (out.length >= replyCap) break;
+        const w = watches.get(mint);
+        if (w === undefined || w.finished || w.buyAttempted) continue;
+        if (openDeals >= state.hello.caps.max_open_positions) break;
+        if (w.crossSlot === null) continue;
+
+        if (slotNow - w.crossSlot > T.crossFreshnessSlots) {
+          w.finished = true;
           continue;
         }
-        if (P.skipCreatorSold && c.creatorHasSold) {
-          c.retired = true;
+        if (T.bailOnCreatorSale && w.creatorHasSold) {
+          w.finished = true;
           continue;
         }
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
-        if (curve.real_quote_reserves < P.entryReserveFloorLamports) continue;
-        if (c.creatorOpeningBuy > P.creatorBuyCapLamports) continue;
-        if (c.buyerWallets.size < P.minDistinctBuyers) continue;
-        if (c.boughtTotal - c.soldByOthers < P.minNetBoughtLamports) continue;
-        if (c.biggestSellBps > P.worstSellCapBps) continue;
-        const vt = curve.virtual_token_reserves;
-        const vq = curve.virtual_quote_reserves;
-        if (vt <= 0n || c.bornTokens <= 0n) continue;
-        const priceNow = Number(vq) / Number(vt);
-        const priceAtBirth = Number(c.bornQuote) / Number(c.bornTokens);
+        if (curve.real_quote_reserves < T.reserveFloorAtEntry) continue;
+        if (w.creatorBirthBought > T.creatorBirthBuyMax) continue;
+        if (w.walletsThatBought.size < T.buyersNeeded) continue;
+        if (w.grossBought - w.grossSoldByOthers < T.netBoughtNeeded) continue;
+        if (w.largestSellShareBps > T.biggestSellMaxBps) continue;
+        const vTokens = curve.virtual_token_reserves;
+        const vQuote = curve.virtual_quote_reserves;
+        if (vTokens <= 0n || w.birthTokenReserves <= 0n) continue;
+        const priceNow = Number(vQuote) / Number(vTokens);
+        const priceAtBirth = Number(w.birthQuoteReserves) / Number(w.birthTokenReserves);
         if (!(priceAtBirth > 0) || !(priceNow > 0)) continue;
-        const runup = Math.floor((priceNow / priceAtBirth) * 10_000);
-        if (runup < P.runupLowBps || runup > P.runupHighBps) continue;
-        if (c.peakSinceSurge <= 0) continue;
-        const dip = Math.floor((1 - priceNow / c.peakSinceSurge) * 10_000);
-        if (dip < P.dipLowBps || dip > P.dipHighBps) continue;
-        const flow = windowFlow(c, now);
-        if (flow.net < P.minFlowNetLamports || flow.buyers < P.minFlowBuyers) continue;
-        const reserveCap = state.maxBuyLamports(mint);
-        const amount = P.stakeLamports < reserveCap ? P.stakeLamports : reserveCap;
-        if (amount < P.minOrderLamports) continue;
-        if (cash < amount + txFee) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: P.buySlippageBps });
-        cash -= amount + txFee;
-        c.buyPlaced = true;
-        openCount += 1;
+        const multipleBps = Math.floor((priceNow / priceAtBirth) * 10_000);
+        if (multipleBps < T.priceMultipleMinBps || multipleBps > T.priceMultipleMaxBps) continue;
+        if (w.peakPriceAfterCross <= 0) continue;
+        const dipBps = Math.floor((1 - priceNow / w.peakPriceAfterCross) * 10_000);
+        if (dipBps < T.dipBandMinBps || dipBps > T.dipBandMaxBps) continue;
+        const flow = recentFlow(w, slotNow);
+        if (flow.net < T.recentNetMin || flow.buyers < T.recentBuyersMin) continue;
+
+        const harnessCap = state.maxBuyLamports(mint);
+        const wanted = stakeFor(w);
+        const stake = wanted < harnessCap ? wanted : harnessCap;
+        if (stake < T.smallestOrder) continue;
+        if (spendable < stake + perTxFee) continue;
+        out.push({ side: 'buy', mint, quote_lamports: stake, max_slippage_bps: T.buySlippageBps });
+        spendable -= stake + perTxFee;
+        w.buyAttempted = true;
+        openDeals += 1;
       }
-      return orders;
+      return out;
     },
   };
 }

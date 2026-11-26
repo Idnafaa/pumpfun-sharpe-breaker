@@ -1,15 +1,15 @@
-// Quietline — pump.fun Sharpe Sprint paper bot (agent-fun/replay/v2).
+// Swiftline — entrypoint for the make.fun Pump.fun Sharpe Sprint bot.
 //
-// The grader runs this file as `node /bot/main.ts`. All wire-protocol
-// handling lives in the vendored SDK shim (vendor/makefun-bot.ts, a
-// byte-identical copy of the kit's sdk/ts file); all trading decisions
-// live in strategy.ts.
+// The grader starts this file directly (`node /bot/main.ts`). The wire
+// protocol is handled by the vendored SDK shim in vendor/makefun-bot.ts
+// (an unmodified copy of the kit's sdk/ts file); every trading decision
+// is made in strategy.ts. This file only connects the two.
 
 import { runBot } from './vendor/makefun-bot.ts';
-import { createQuietline, QUIETLINE_DEFAULTS } from './strategy.ts';
+import { buildSwiftline, SWIFTLINE_TUNING } from './strategy.ts';
 
-const bot = createQuietline(QUIETLINE_DEFAULTS);
+const swiftline = buildSwiftline(SWIFTLINE_TUNING);
 
 await runBot({
-  onBatch: (state, batch) => bot.onBatch(state, batch),
+  onBatch: (state, batch) => swiftline.handleBatch(state, batch),
 });
